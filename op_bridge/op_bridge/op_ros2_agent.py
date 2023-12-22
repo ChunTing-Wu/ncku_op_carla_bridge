@@ -157,10 +157,15 @@ class Ros2Agent(AutonomousAgent):
             GearCommand, '/control/command/gear_cmd', self.on_autoware_universe_change_gear,
             qos_profile=QoSProfile(depth=1))
 
+        # Remote Control
+        self.remote_control_subscriber = self.ros2_node.create_subscription(
+            Bool, '/remote_control_flag', self.on_remote_control,
+            qos_profile=QoSProfile(depth=1))
         self.remote_change_gear_subscriber = self.ros2_node.create_subscription(
             GearCommand, '/remote_control_gear_cmd', self.on_remote_change_gear,
             qos_profile=QoSProfile(depth=1))
         
+        self.is_remote_control = False
         self.current_control = carla.VehicleControl()
         self.waypoint_publisher = self.ros2_node.create_publisher(Path, self.topic_waypoints, 1)
 
@@ -236,6 +241,72 @@ class Ros2Agent(AutonomousAgent):
 
     def on_autoware_universe_change_gear(self, data):
         #gear = data
+        if self.is_remote_control == False:
+            gear = 0
+            if data.command == 20 or data.command == 21:
+                gear = -1
+            elif data.command == 22:
+                gear = 0
+            elif (data.command >= 2 and data.command <= 19) or data.command == 23 or data.command == 24:
+                gear = 1
+            self.gear = gear
+
+    def on_autoware_universe_vehicle_control(self, data):
+        
+        if self.is_remote_control == False:
+            cmd = carla.VehicleControl()  
+
+            #cmd.steer = (-data.lateral.steering_tire_angle / self.max_steer_angle) #* self.steering_factor
+            # if data.lateral.steering_tire_angle > 0.0:
+            #     cmd.steer = -0.1 
+            # else:
+            #     cmd.steer = 0.1 
+
+            speed_diff = data.longitudinal.speed - self.speed 
+
+            # print("data.lateral.steering_tire_angle = " + str(data.lateral.steering_tire_angle) + ", cmd.steer = " + str(cmd.steer))
+            # print("data.longitudinal.speed = " + str(data.longitudinal.speed) + ", self.speed = " + str(self.speed))
+
+            if(self.gear == -1):
+                # print("backward........")
+                cmd.steer = (-data.lateral.steering_tire_angle / self.max_steer_angle)
+                cmd.reverse = True
+                if speed_diff < 0:            
+                    cmd.throttle = 0.3 #0.65
+                    cmd.brake = 0.0
+                elif speed_diff > 0.0:
+                    cmd.throttle = 0.0
+                    if data.longitudinal.speed >= 0.0:
+                        cmd.brake = 0.75
+                    elif speed_diff < 1:
+                        cmd.brake = 0.0
+                    else:
+                        cmd.brake = 0.0
+            else:
+                # print("forward........")
+                cmd.steer = (-data.lateral.steering_tire_angle / self.max_steer_angle) * self.steering_factor * self.steering_factor_2 
+                cmd.reverse = False
+                if speed_diff > 0.001:
+                    cmd.throttle = 0.5 #0.75
+                    cmd.brake = 0.0
+                elif speed_diff < 0.001:
+                    cmd.throttle = 0.0
+                    if data.longitudinal.speed <= 0.0:
+                        cmd.brake = 0.3
+                    elif speed_diff > -0.1:
+                        cmd.brake = 0.0
+                    else:
+                        cmd.brake = 0.0
+
+            # print("cmd = " + str(cmd))
+            #if(self.gear)
+            cmd.gear = self.gear
+
+            # cmd.steer = -data.lateral.steering_tire_rotation_angle 
+            self.current_control = cmd
+            self.step_mode_possible = True
+
+    def on_remote_change_gear(self,data):
         gear = 0
         if data.command == 20 or data.command == 21:
             gear = -1
@@ -244,61 +315,8 @@ class Ros2Agent(AutonomousAgent):
         elif (data.command >= 2 and data.command <= 19) or data.command == 23 or data.command == 24:
             gear = 1
         self.gear = gear
-
-    def on_autoware_universe_vehicle_control(self, data):
-        
-
-        cmd = carla.VehicleControl()  
-
-        #cmd.steer = (-data.lateral.steering_tire_angle / self.max_steer_angle) #* self.steering_factor
-        # if data.lateral.steering_tire_angle > 0.0:
-        #     cmd.steer = -0.1 
-        # else:
-        #     cmd.steer = 0.1 
-
-        speed_diff = data.longitudinal.speed - self.speed 
-
-        # print("data.lateral.steering_tire_angle = " + str(data.lateral.steering_tire_angle) + ", cmd.steer = " + str(cmd.steer))
-        # print("data.longitudinal.speed = " + str(data.longitudinal.speed) + ", self.speed = " + str(self.speed))
-
-        if(self.gear == -1):
-            # print("backward........")
-            cmd.steer = (-data.lateral.steering_tire_angle / self.max_steer_angle)
-            cmd.reverse = True
-            if speed_diff < 0:            
-                cmd.throttle = 0.3 #0.65
-                cmd.brake = 0.0
-            elif speed_diff > 0.0:
-                cmd.throttle = 0.0
-                if data.longitudinal.speed >= 0.0:
-                    cmd.brake = 0.75
-                elif speed_diff < 1:
-                    cmd.brake = 0.0
-                else:
-                    cmd.brake = 0.0
-        else:
-            # print("forward........")
-            cmd.steer = (-data.lateral.steering_tire_angle / self.max_steer_angle) * self.steering_factor * self.steering_factor_2 
-            cmd.reverse = False
-            if speed_diff > 0.001:
-                cmd.throttle = 0.5 #0.75
-                cmd.brake = 0.0
-            elif speed_diff < 0.001:
-                cmd.throttle = 0.0
-                if data.longitudinal.speed <= 0.0:
-                    cmd.brake = 0.3
-                elif speed_diff > -0.1:
-                    cmd.brake = 0.0
-                else:
-                    cmd.brake = 0.0
-
-        # print("cmd = " + str(cmd))
-        #if(self.gear)
-        cmd.gear = self.gear
-
-        # cmd.steer = -data.lateral.steering_tire_rotation_angle 
-        self.current_control = cmd
-        self.step_mode_possible = True
+    def on_remote_control(self,data):
+        self.is_remote_control = data.data
 
     def on_vehicle_control(self, data):
         """
@@ -710,3 +728,48 @@ class Ros2Agent(AutonomousAgent):
             name_start_index = name_start_index + 1        
 
         return map_full_name[name_start_index:len(map_full_name)]
+
+  
+# class WebSocketThread(threading.Thread):
+#     global HOST_IP, PORT
+#     def __init__(self):
+#         threading.Thread.__init__(self)
+#         self.ws = None
+#         self.queue = queue.Queue()
+#     def run(self):
+#         try:
+#             """
+#             main loop
+#             """
+#             ws_link = "ws://" + HOST_IP + ":" + PORT
+#             self.ws = websocket.WebSocketApp(ws_link, on_open=self.on_open,on_error=self.on_error, on_message=self.on_message) # add receive handler
+#             print("websocket start")
+
+#             recv_thread = threading.Thread(target=self.ws.run_forever)
+#             recv_thread.start()
+#             time.sleep(5)
+#             try:
+#                 _break_times = 3
+#                 while _break_times > 0:
+#                     sendData = {
+#                     "START_SUCCESS": {
+#                         "START_SUCCESS":0,
+#                     }}
+#                     json_data = json.dumps(sendData)
+#                     self.ws.send(json_data)
+#                     time.sleep(0.5)
+#                     _break_times = _break_times - 1
+#             except KeyboardInterrupt:
+#                  print("Error Interrupt...")
+#         except Exception as e:
+#             print("WebSocket connection error:", e)
+            
+#     def on_message(self, ws, message):
+#         """
+#         WebSocket Receive Message !!
+#         """
+#         print("Received:", message)
+#     def on_error(ws, error):
+#         print(error)
+#     def on_open(self,ws):
+#         print("start on open")
