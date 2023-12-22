@@ -1,5 +1,8 @@
 # op_agent - OpenPlanner Agent for CARLA Simulator
 
+### Town 10HD Map
+
+[Google Drive](https://drive.google.com/drive/folders/1UqbT3_BaMthdUAXxaC5BFd5f9USI8Ygp?usp=sharing)
 
 ### Additional missing [data](https://drive.google.com/drive/folders/1Or0CMS08AW8XvJtzzR8TfhqdY9MMUBpS?usp=sharing): 
 - PointCloud .pcd Maps 
