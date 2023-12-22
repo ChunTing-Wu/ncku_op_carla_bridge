@@ -39,8 +39,19 @@ from leaderboard.autoagents.autonomous_agent import AutonomousAgent, Track
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from autoware_auto_vehicle_msgs.msg import ControlModeReport, GearReport, SteeringReport, TurnIndicatorsReport, HazardLightsReport, VelocityReport
 from autoware_auto_control_msgs.msg import AckermannControlCommand
+from autoware_sensing_msgs.msg import GnssInsOrientationStamped
 
+from autoware_auto_vehicle_msgs.msg import GearCommand
+from std_msgs.msg import Bool
 
+import queue
+import websocket
+import json
+import threading
+from autoware_auto_system_msgs.msg import AutowareState
+
+HOST_IP = "127.0.0.1"
+PORT = "8764"
 def get_entry_point():
     return 'Ros2Agent'
 
@@ -59,7 +70,6 @@ class Ros2Agent(AutonomousAgent):
 
     This agent expects a roscore to be running.
     """
-
     speed = None
     current_control = None
     stack_process = None    
@@ -73,8 +83,9 @@ class Ros2Agent(AutonomousAgent):
     open_drive_map_data = None
     open_drive_map_name = None
     steering_factor = 0.45
+    steering_factor_2 = 0.8918
     max_steer_angle = 0.7
-
+    gear = 0
     def setup(self, path_to_conf_file):
         """
         setup agent
@@ -140,9 +151,22 @@ class Ros2Agent(AutonomousAgent):
         self.autoware_universe_vehicle_control_subscriber = self.ros2_node.create_subscription(
             AckermannControlCommand, 'control/command/control_cmd', self.on_autoware_universe_vehicle_control,
             qos_profile=QoSProfile(depth=1))
+        
+        # Add Gear
+        self.autoware_universe_gear_control_subscriber = self.ros2_node.create_subscription(
+            GearCommand, '/control/command/gear_cmd', self.on_autoware_universe_change_gear,
+            qos_profile=QoSProfile(depth=1))
 
+        # Remote Control
+        self.remote_control_subscriber = self.ros2_node.create_subscription(
+            Bool, '/remote_control_flag', self.on_remote_control,
+            qos_profile=QoSProfile(depth=1))
+        self.remote_change_gear_subscriber = self.ros2_node.create_subscription(
+            GearCommand, '/remote_control_gear_cmd', self.on_remote_change_gear,
+            qos_profile=QoSProfile(depth=1))
+        
+        self.is_remote_control = False
         self.current_control = carla.VehicleControl()
-
         self.waypoint_publisher = self.ros2_node.create_publisher(Path, self.topic_waypoints, 1)
 
         for sensor in self.sensors():
@@ -162,7 +186,7 @@ class Ros2Agent(AutonomousAgent):
             elif sensor['type'] == 'sensor.speedometer':                
                 if not self.vehicle_status_publisher:
                     self.vehicle_status_publisher = self.ros2_node.create_publisher(
-                        Odometry, '/odo', 1)
+                        Odometry, '/odom', 1)
                 if not self.auto_velocity_status_publisher:
                     self.auto_velocity_status_publisher = self.ros2_node.create_publisher(
                         VelocityReport, '/vehicle/status/velocity_status', 1)
@@ -182,6 +206,8 @@ class Ros2Agent(AutonomousAgent):
                 if not self.vehicle_imu_publisher:
                     self.vehicle_imu_publisher = self.ros2_node.create_publisher(
                         Imu, '/sensing/imu/tamagawa/imu_raw', 1)
+                    self.vehicle_orientation_publisher = self.ros2_node.create_publisher(
+                        GnssInsOrientationStamped, '/autoware_orientation', 1)
             elif sensor['type'] == 'sensor.opendrive_map':                                
                 if not self.map_file_publisher:
                     self.map_file_publisher = self.ros2_node.create_publisher(String, '/carla/map_file', 1)                
@@ -190,6 +216,10 @@ class Ros2Agent(AutonomousAgent):
         
         self.spin_thread = threading.Thread(target=rclpy.spin, args=(self.ros2_node,))
         self.spin_thread.start()
+
+        # self.ws_thread = WebSocketThread()
+        # self.ws_thread.daemon = True
+        # self.ws_thread.start()
 
     def init_local_agent(self, role_name, map_name, waypoints_topic_name, enable_explore):
         # rospy.loginfo("Executing stack...")
@@ -208,31 +238,85 @@ class Ros2Agent(AutonomousAgent):
         f = open(opendrive_map_path, "w")
         f.write(map_data)
         f.close()
-    
+
+    def on_autoware_universe_change_gear(self, data):
+        #gear = data
+        if self.is_remote_control == False:
+            gear = 0
+            if data.command == 20 or data.command == 21:
+                gear = -1
+            elif data.command == 22:
+                gear = 0
+            elif (data.command >= 2 and data.command <= 19) or data.command == 23 or data.command == 24:
+                gear = 1
+            self.gear = gear
+
     def on_autoware_universe_vehicle_control(self, data):
         
-        # print(' $$$$$$$$$$$$$ >>>> Steering Angle: ', data.lateral.steering_tire_angle)
-        
-        cmd = carla.VehicleControl()  
+        if self.is_remote_control == False:
+            cmd = carla.VehicleControl()  
 
-        cmd.steer = (-data.lateral.steering_tire_angle / self.max_steer_angle)*self.steering_factor
-        speed_diff = data.longitudinal.speed - self.speed 
-        if speed_diff > 0:            
-            cmd.throttle = 0.75           
-            cmd.brake = 0.0   
-        elif speed_diff < 0.0:
-            cmd.throttle = 0.0
-            if data.longitudinal.speed <= 0.0 :                
-                cmd.brake = 0.75  
-            elif  speed_diff > -1:
-                cmd.brake = 0.0
-            else :
-                cmd.brake = 0.01
+            #cmd.steer = (-data.lateral.steering_tire_angle / self.max_steer_angle) #* self.steering_factor
+            # if data.lateral.steering_tire_angle > 0.0:
+            #     cmd.steer = -0.1 
+            # else:
+            #     cmd.steer = 0.1 
 
-        # cmd.steer = -data.lateral.steering_tire_rotation_angle 
-        self.current_control = cmd
-        self.step_mode_possible = True
+            speed_diff = data.longitudinal.speed - self.speed 
 
+            # print("data.lateral.steering_tire_angle = " + str(data.lateral.steering_tire_angle) + ", cmd.steer = " + str(cmd.steer))
+            # print("data.longitudinal.speed = " + str(data.longitudinal.speed) + ", self.speed = " + str(self.speed))
+
+            if(self.gear == -1):
+                # print("backward........")
+                cmd.steer = (-data.lateral.steering_tire_angle / self.max_steer_angle)
+                cmd.reverse = True
+                if speed_diff < 0:            
+                    cmd.throttle = 0.3 #0.65
+                    cmd.brake = 0.0
+                elif speed_diff > 0.0:
+                    cmd.throttle = 0.0
+                    if data.longitudinal.speed >= 0.0:
+                        cmd.brake = 0.75
+                    elif speed_diff < 1:
+                        cmd.brake = 0.0
+                    else:
+                        cmd.brake = 0.0
+            else:
+                # print("forward........")
+                cmd.steer = (-data.lateral.steering_tire_angle / self.max_steer_angle) * self.steering_factor * self.steering_factor_2 
+                cmd.reverse = False
+                if speed_diff > 0.001:
+                    cmd.throttle = 0.5 #0.75
+                    cmd.brake = 0.0
+                elif speed_diff < 0.001:
+                    cmd.throttle = 0.0
+                    if data.longitudinal.speed <= 0.0:
+                        cmd.brake = 0.3
+                    elif speed_diff > -0.1:
+                        cmd.brake = 0.0
+                    else:
+                        cmd.brake = 0.0
+
+            # print("cmd = " + str(cmd))
+            #if(self.gear)
+            cmd.gear = self.gear
+
+            # cmd.steer = -data.lateral.steering_tire_rotation_angle 
+            self.current_control = cmd
+            self.step_mode_possible = True
+
+    def on_remote_change_gear(self,data):
+        gear = 0
+        if data.command == 20 or data.command == 21:
+            gear = -1
+        elif data.command == 22:
+            gear = 0
+        elif (data.command >= 2 and data.command <= 19) or data.command == 23 or data.command == 24:
+            gear = 1
+        self.gear = gear
+    def on_remote_control(self,data):
+        self.is_remote_control = data.data
 
     def on_vehicle_control(self, data):
         """
@@ -242,7 +326,12 @@ class Ros2Agent(AutonomousAgent):
         cmd.throttle = data.twist.linear.x/100.0
         cmd.steer = data.twist.angular.z/100.0
         cmd.brake = data.twist.linear.y/100.0        
-
+        cmd.gear = self.gear
+        if(self.gear == -1):
+            cmd.reverse = True
+            cmd.gear = 0
+        else:
+            cmd.reverse = False
         #print('Received Command : ', cmd.throttle, cmd.steer)
         # if cmd.throttle < 0:
         #     cmd.reverse = 1
@@ -304,16 +393,25 @@ class Ros2Agent(AutonomousAgent):
         self.waypoint_publisher.publish(msg)
 
     def sensors(self):
-        sensors = [{'type': 'sensor.camera.rgb', 'x': 0.7, 'y': 0.0, 'z': 1.6, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-            'width': 1280, 'height': 720, 'fov': 100, 'id': 'Center'},
-            {'type': 'sensor.lidar.ray_cast', 'x': 0.0, 'y': 0.0, 'z': 2.4, 'roll': 0.0, 'pitch': 0.0,
+        sensors = [{'type': 'sensor.lidar.ray_cast', 'x': 0.0
+                    , 'y': 0.0, 'z': 3.0, 'roll': 0.0, 'pitch': 0.0,
              'yaw': 270.0, 'id': 'LIDAR'},
-            {'type': 'sensor.other.gnss', 'x': 0.0, 'y': 0.0, 'z': 2.4, 'id': 'GPS'},
+            {'type': 'sensor.other.gnss', 'x': 0.0, 'y': 0.0, 'z': 0.0, 'id': 'GPS'},
             {'type': 'sensor.opendrive_map', 'reading_frequency': 1, 'id': 'OpenDRIVE'},
             {'type': 'sensor.speedometer', 'reading_frequency': 10, 'id': 'speed'},
             {'type': 'sensor.other.imu', 'x': 0.0, 'y': 0.0, 'z': 2.4, 'roll': 0.0, 'pitch': 0.0,
              'yaw': 270.0, 'id': 'IMU'},
             ]
+        # sensors = [{'type': 'sensor.camera.rgb', 'x': 0.7, 'y': 0.0, 'z': 1.6, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+        #     'width': 1280, 'height': 720, 'fov': 100, 'id': 'Center'},
+        #     {'type': 'sensor.lidar.ray_cast', 'x': 0.0, 'y': 0.0, 'z': 2.4, 'roll': 0.0, 'pitch': 0.0,
+        #      'yaw': 270.0, 'id': 'LIDAR'},
+        #     {'type': 'sensor.other.gnss', 'x': 0.0, 'y': 0.0, 'z': 2.4, 'id': 'GPS'},
+        #     {'type': 'sensor.opendrive_map', 'reading_frequency': 1, 'id': 'OpenDRIVE'},
+        #     {'type': 'sensor.speedometer', 'reading_frequency': 10, 'id': 'speed'},
+        #     {'type': 'sensor.other.imu', 'x': 0.0, 'y': 0.0, 'z': 2.4, 'roll': 0.0, 'pitch': 0.0,
+        #      'yaw': 270.0, 'id': 'IMU'},
+        #     ]
         return sensors
 
     def get_header(self):
@@ -380,11 +478,12 @@ class Ros2Agent(AutonomousAgent):
         msg.header.frame_id = 'gnss_link'
         msg.latitude = data[0]
         msg.longitude = data[1]
-        msg.altitude = data[2] + 17.0
+        msg.altitude = data[2] #+ 17.0
         msg.status.status = NavSatStatus.STATUS_SBAS_FIX
         # pylint: disable=line-too-long
         msg.status.service = NavSatStatus.SERVICE_GPS | NavSatStatus.SERVICE_GLONASS | NavSatStatus.SERVICE_COMPASS | NavSatStatus.SERVICE_GALILEO
         # pylint: enable=line-too-long
+        #print(msg)
         self.publisher_map[sensor_id].publish(msg)
 
     def publish_camera(self, sensor_id, data):
@@ -394,7 +493,7 @@ class Ros2Agent(AutonomousAgent):
         msg = self.cv_bridge.cv2_to_imgmsg(data, encoding='bgra8')
         # the camera data is in respect to the camera's own frame
         msg.header = self.get_header()
-        msg.header.frame_id = 'camera4/camera_link'
+        msg.header.frame_id = 'camera1/camera_link'
 
         cam_info = self.id_to_camera_info_map[sensor_id]
         cam_info.header = msg.header
@@ -422,13 +521,30 @@ class Ros2Agent(AutonomousAgent):
         
         imu_rotation = data[6]
 
-        quaternion = euler2quat(0, 0, -math.radians(imu_rotation))
-        imu_msg.orientation.x = quaternion[0]
-        imu_msg.orientation.y = quaternion[1]
-        imu_msg.orientation.z = quaternion[2]
-        imu_msg.orientation.w = quaternion[3]
-        
+        # https://matthew-brett.github.io/transforms3d/reference/transforms3d.euler.html#transforms3d.euler.euler2quat
+        # euler2quat return Quaternion in w, x, y z (real, then vector) format
+        # By the right hand rule, the yaw component of orientation increases as the child frame rotates counter-clockwise,
+        # and for geographic poses, yaw is zero when pointing east.
+        quaternion = euler2quat(0, 0, -imu_rotation) #-math.radians(imu_rotation))
+        imu_msg.orientation.w = quaternion[0]
+        imu_msg.orientation.x = quaternion[1]
+        imu_msg.orientation.y = quaternion[2]
+        imu_msg.orientation.z = quaternion[3]
+
         self.vehicle_imu_publisher.publish(imu_msg)
+
+        # package orientation for GNSSINS Topic
+        orientation_msg = GnssInsOrientationStamped()
+        orientation_msg.header = self.get_header()
+        orientation_msg.orientation.orientation.w = quaternion[0]
+        orientation_msg.orientation.orientation.x = quaternion[1]
+        orientation_msg.orientation.orientation.y = quaternion[2]
+        orientation_msg.orientation.orientation.z = quaternion[3]
+        orientation_msg.orientation.rmse_rotation_x = 0.0
+        orientation_msg.orientation.rmse_rotation_y = 0.0
+        orientation_msg.orientation.rmse_rotation_z = 0.0
+        
+        self.vehicle_orientation_publisher.publish(orientation_msg)
 
     def publish_can(self, sensor_id, data):
         """
@@ -466,7 +582,7 @@ class Ros2Agent(AutonomousAgent):
         self.auto_velocity_status_publisher.publish(vel_rep)
 
         steer_rep = SteeringReport()
-        steer_rep.steering_tire_angle = (-self.current_control.steer * self.max_steer_angle)/self.steering_factor
+        steer_rep.steering_tire_angle = (-self.current_control.steer * self.max_steer_angle) #/self.steering_factor
         self.auto_steering_status_publisher.publish(steer_rep)
 
         gear_rep = GearReport()
@@ -612,7 +728,3 @@ class Ros2Agent(AutonomousAgent):
             name_start_index = name_start_index + 1        
 
         return map_full_name[name_start_index:len(map_full_name)]
-
-
-
-  
